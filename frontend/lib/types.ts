@@ -10,23 +10,59 @@ export interface PositionFeatures {
 export interface MistakeExplanation {
   mistake_category: string;
   mistake_label: string;
-  why_player_move: string;
-  why_best_move: string;
+  engine_layer: {
+    eval_summary: string;
+    best_line: string;
+    candidate_summary: string;
+  };
+  tactical_layer: {
+    motif: string;
+    explanation: string;
+  };
+  strategic_layer: {
+    concept: string;
+    explanation: string;
+  };
+  human_layer: {
+    likely_thought: string;
+    correction: string;
+  };
   engine_line_idea: string;
+  coach_question: string;
   how_to_find: string[];
   key_lesson: string;
+  why_player_move?: string;
+  why_best_move?: string;
 }
 
-export interface CriticalMoment {
-  move_index: number;    // 0-based index into moves_san
-  move_number: number;   // full-move number shown in chess notation
+export type Severity = "blunder" | "mistake" | "inaccuracy" | "slight";
+export type Language = "en" | "zh";
+
+export interface EngineMove {
+  move_index: number;
+  move_number: number;
   color: string;
-  fen_before: string;
   player_move: string;
   best_move: string;
   eval_loss: number;
+  severity: Severity;
+  eval_before: number;
+  eval_after_player: number;
+  eval_after_best: number;
   pv_moves: string[];
-  explanation: MistakeExplanation;
+  candidate_lines: CandidateLine[];
+}
+
+export interface CandidateLine {
+  move: string;
+  line: string[];
+  centipawn: number | null;
+  mate: number | null;
+}
+
+export interface CriticalMoment extends EngineMove {
+  fen_before: string;
+  explanation: MistakeExplanation | null;
   position_features: PositionFeatures;
 }
 
@@ -44,26 +80,43 @@ export interface TrainingDay {
 }
 
 export interface TrainingPlan {
-  focus_concept: string;
-  focus_explanation: string;
-  puzzle_themes: string[];
-  pre_move_checklist: string[];
-  weekly_schedule: TrainingDay[];
+  focus_concept?: string;
+  focus_explanation?: string;
+  puzzle_themes?: string[];
+  pre_move_checklist?: string[];
+  weekly_schedule?: TrainingDay[];
+  puzzles?: TrainingPuzzle[];
+}
+
+export interface TrainingPuzzle {
+  id: string;
+  fen: string;
+  move_number: number;
+  side_to_move: string;
+  prompt: string;
+  solution: string;
+  solution_line: string[];
+  theme: string;
+  source_mistake: string;
+  label: string;
 }
 
 export interface GameInfo {
   moves_san: string[];
-  fens: string[];          // fens[0] = start; fens[i] = after moves_san[i-1]
+  fens: string[];
   player_color: "white" | "black";
   headers: Record<string, string>;
   total_moves: number;
 }
 
 export interface AnalysisResult {
+  language: Language;
   game: GameInfo;
+  engine_analysis: EngineMove[];         // all evaluated player moves, sorted by eval_loss desc
   critical_moments: CriticalMoment[];
-  game_summary: GameSummary;
-  training_plan: TrainingPlan;
+  game_summary: GameSummary | null;
+  training_plan: TrainingPlan | null;
+  llm_available: boolean;
 }
 
 export interface AnalysisResponse {

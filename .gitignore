@@ -1,6 +1,7 @@
 .venv
-__ pycache__
+__pycache__
 *.pyc
 frontend/.next
 frontend/node_modules
 .env
+.claude

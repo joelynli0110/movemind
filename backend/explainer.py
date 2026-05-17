@@ -1,24 +1,41 @@
 """
-Claude-powered coach explanations.
+Coach explanation pipeline.
 
-Design principle: Engine decides. LLM explains.
-All evaluations come from Stockfish; Claude only generates teaching language.
-
-Uses prompt caching on the large system prompt to reduce cost on repeated calls.
+Engine decides. The LLM explains. When Chinese is requested, the app first
+generates stable English JSON, then uses the configured machine translator for
+the user-facing values.
 """
-import asyncio
-import json
 import os
 
-import anthropic
-
 from engine import GameData, MoveAnalysis
+from llm import call_llm, is_llm_available, parse_llm_json
 from position import analyze_position
+from translator import translate_json_values
 
-_client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-_MODEL = "claude-sonnet-4-6"
+LLM_EXPLANATION_MAX_TOKENS = int(os.getenv("LLM_EXPLANATION_MAX_TOKENS", "900"))
+LLM_SUMMARY_MAX_TOKENS = int(os.getenv("LLM_SUMMARY_MAX_TOKENS", "640"))
 
-# ── System prompt (cached) ──────────────────────────────────────────────────
+_EXPLANATION_TRANSLATABLE_FIELDS = (
+    "mistake_label",
+    "engine_layer",
+    "tactical_layer",
+    "strategic_layer",
+    "human_layer",
+    "engine_line_idea",
+    "coach_question",
+    "how_to_find",
+    "key_lesson",
+)
+
+
+def _normalize_language(language: str | None) -> str:
+    return "zh" if language == "zh" else "en"
+
+
+def _position_features_dict(fen: str) -> dict:
+    return vars(analyze_position(fen))
+
+
 _SYSTEM = """You are MoveMind Coach, an expert chess coach who explains chess mistakes in the style of a patient grandmaster teaching a student.
 
 ## Core Philosophy
@@ -29,64 +46,97 @@ You focus on process:
 - Why did the player choose their move? What natural-looking reasoning led to it?
 - What was the hidden flaw in that reasoning?
 - How does the best move solve the key problem in the position?
-- What should the player CHECK FOR next time before making a similar move?
+- What should the player check for next time before making a similar move?
 
 ## Teaching levels
 - beginner (< 1000 Elo): use everyday language, avoid jargon, explain piece names
-- intermediate (1000–1500 Elo): use standard chess terms, give concrete rules of thumb
-- advanced (1500–1800 Elo): use precise terminology, discuss subtler strategic concepts
+- intermediate (1000-1500 Elo): use standard chess terms, give concrete rules of thumb
+- advanced (1500-1800 Elo): use precise terminology, discuss subtler strategic concepts
 
 ## Output format
-Always respond with ONLY valid JSON — no markdown fences, no extra text.
-Malformed JSON is a critical failure."""
+Always respond with ONLY valid JSON. No markdown fences, no extra text.
+Malformed JSON is a critical failure.
+Write every user-facing JSON value in English."""
 
-# ── Mistake explanation prompt ──────────────────────────────────────────────
+
 def _mistake_prompt(m: MoveAnalysis, features, player_elo: int) -> str:
     level = "beginner" if player_elo < 1000 else "intermediate" if player_elo < 1500 else "advanced"
     pv = " ".join(m.pv_moves) if m.pv_moves else "not available"
+    candidates = "\n".join(
+        f"  {i + 1}. {c.move}: {' '.join(c.line) if c.line else c.move}"
+        f" | eval={_format_candidate_eval(c.centipawn, c.mate)}"
+        for i, c in enumerate(m.candidate_lines[:3])
+    ) or "  not available"
     tac = ", ".join(features.tactical_motifs) if features.tactical_motifs else "none detected"
     files = ", ".join(features.open_files[:3]) if features.open_files else "none"
 
-    return f"""Analyze this chess mistake and respond with ONLY a JSON object.
+    return f"""Analyze this chess {m.severity} and respond with ONLY a JSON object.
 
 CONTEXT
 Move {m.move_number} ({m.color} to move) | Player Elo: {player_elo} ({level})
+Severity      : {m.severity} ({m.eval_loss} centipawns lost)
 Player's move : {m.player_move}
 Engine best   : {m.best_move}
-Eval loss     : {m.eval_loss} centipawns
 Best line (PV): {pv}
+Candidate lines:
+{candidates}
 
 POSITION FEATURES (before the mistake)
-Material     : {features.material_balance}
-King safety  : {features.king_safety}
-Pawn struct  : {features.pawn_structure}
+Material      : {features.material_balance}
+King safety   : {features.king_safety}
+Pawn structure: {features.pawn_structure}
 Piece activity: {features.piece_activity}
 Tactical motifs: {tac}
-Open files   : {files}
-FEN          : {m.fen_before}
+Open files    : {files}
+FEN           : {m.fen_before}
 
 Respond with this exact JSON structure:
 {{
   "mistake_category": "one of: tactical_blindness | king_safety_neglect | wrong_trade | premature_attack | passive_play | pawn_structure_error | missed_tactic | strategic_misunderstanding",
   "mistake_label": "short phrase like 'Missed knight fork' or 'Ignored Bxh7+ sacrifice threat'",
-  "why_player_move": "2–3 sentences: first acknowledge why the player's move LOOKS natural, then reveal the hidden problem",
-  "why_best_move": "2–3 sentences: explain the KEY IDEA behind the engine's suggestion — compress the PV into one human-understandable concept, not a list of moves",
+  "engine_layer": {{
+    "eval_summary": "1 sentence explaining the eval loss and best move in human terms",
+    "best_line": "the engine line as SAN text, copied from the PV when useful",
+    "candidate_summary": "1 sentence comparing the top candidates without overloading the user"
+  }},
+  "tactical_layer": {{
+    "motif": "the concrete tactical theme, or 'No forcing tactic detected'",
+    "explanation": "1-2 sentences about checks, captures, threats, pins, forks, or other forcing details"
+  }},
+  "strategic_layer": {{
+    "concept": "the long-term positional concept involved",
+    "explanation": "1-2 sentences about king safety, pawn structure, open files, weak squares, piece activity, or trades"
+  }},
+  "human_layer": {{
+    "likely_thought": "1 sentence explaining why the player's move looked natural to a human",
+    "correction": "1-2 sentences naming the thinking habit to fix next time"
+  }},
   "engine_line_idea": "1 sentence summarizing what the best continuation is trying to achieve",
+  "coach_question": "one Socratic question the coach should ask before revealing the answer",
   "how_to_find": [
-    "Concrete question or rule (e.g. 'Before moving, ask: does my opponent have a check, capture, or major threat?')",
+    "Concrete question or rule the player should ask before similar moves",
     "Second rule relevant to this specific mistake",
     "Third rule"
   ],
-  "key_lesson": "One memorable sentence the player should internalize from this mistake"
+  "key_lesson": "One memorable sentence the player should internalize"
 }}"""
 
 
-# ── Summary + training plan prompt ─────────────────────────────────────────
+def _format_candidate_eval(centipawn: int | None, mate: int | None) -> str:
+    if mate is not None:
+        return f"mate {mate}"
+    if centipawn is not None:
+        return f"{centipawn / 100:+.2f}"
+    return "n/a"
+
+
 def _summary_prompt(game_data: GameData, explanations: list[dict], player_elo: int) -> str:
     level = "beginner" if player_elo < 1000 else "intermediate" if player_elo < 1500 else "advanced"
     mistakes_text = "\n".join(
-        f"  Mistake {i+1}: [{e.get('mistake_category','?')}] {e.get('mistake_label','?')} — {e.get('key_lesson','')}"
+        f"  Mistake {i + 1}: [{e.get('mistake_category', '?')}] "
+        f"{e.get('mistake_label', '?')} - {e.get('key_lesson', '')}"
         for i, e in enumerate(explanations)
+        if e is not None
     )
     opening = game_data.headers.get("Opening", game_data.headers.get("ECO", "Unknown opening"))
 
@@ -104,15 +154,15 @@ Respond with this exact JSON structure:
   "summary": {{
     "biggest_strength": "one thing the player did well or showed promise in",
     "biggest_weakness": "the single most important recurring pattern in their mistakes",
-    "key_concept": "the one chess concept most worth studying based on these mistakes",
+    "key_concept": "the one chess concept most worth studying",
     "opening_tip": "one specific, actionable opening improvement for next game",
     "accuracy_grade": "one of: A | B | C | D"
   }},
   "training_plan": {{
-    "focus_concept": "the #1 concept to work on this week (2–5 words)",
-    "focus_explanation": "why this is the priority right now (1–2 sentences)",
+    "focus_concept": "the #1 concept to work on this week (2-5 words)",
+    "focus_explanation": "why this is the priority right now (1-2 sentences)",
     "puzzle_themes": [
-      "tactical theme 1 (e.g. 'Bishop sacrifice on h7')",
+      "tactical theme 1",
       "tactical theme 2",
       "tactical theme 3"
     ],
@@ -122,7 +172,7 @@ Respond with this exact JSON structure:
       "Third question"
     ],
     "weekly_schedule": [
-      {{"day": "Day 1", "task": "Specific task (what to study and for how long)"}},
+      {{"day": "Day 1", "task": "Specific task"}},
       {{"day": "Day 2", "task": "Specific task"}},
       {{"day": "Day 3", "task": "Specific task"}},
       {{"day": "Day 4", "task": "Rest or light review"}},
@@ -132,23 +182,39 @@ Respond with this exact JSON structure:
 }}"""
 
 
-# ── Main class ──────────────────────────────────────────────────────────────
 class CoachExplainer:
-    def __init__(self, player_elo: int = 1200):
+    def __init__(self, player_elo: int = 1200, language: str = "en"):
         self.player_elo = player_elo
+        self.language = _normalize_language(language)
+        self._llm_available = is_llm_available()
 
     async def explain_game(self, game_data: GameData) -> dict:
-        if not game_data.critical_moments:
-            return _no_mistakes_result(game_data)
+        def _serialize_move(m: MoveAnalysis) -> dict:
+            return {
+                "move_index": m.move_index,
+                "move_number": m.move_number,
+                "color": m.color,
+                "player_move": m.player_move,
+                "best_move": m.best_move,
+                "eval_loss": m.eval_loss,
+                "severity": m.severity,
+                "eval_before": m.eval_before,
+                "eval_after_player": m.eval_after_player,
+                "eval_after_best": m.eval_after_best,
+                "pv_moves": m.pv_moves,
+                "candidate_lines": [
+                    {
+                        "move": c.move,
+                        "line": c.line,
+                        "centipawn": c.centipawn,
+                        "mate": c.mate,
+                    }
+                    for c in m.candidate_lines
+                ],
+            }
 
-        # Explain all 3 critical moments in parallel
-        explanations = await asyncio.gather(
-            *[self._explain_mistake(m) for m in game_data.critical_moments]
-        )
-
-        summary_and_plan = await self._generate_summary(game_data, list(explanations))
-
-        return {
+        base = {
+            "language": self.language,
             "game": {
                 "moves_san": game_data.moves_san,
                 "fens": game_data.fens,
@@ -156,149 +222,226 @@ class CoachExplainer:
                 "headers": game_data.headers,
                 "total_moves": game_data.total_moves,
             },
-            "critical_moments": [
-                {
-                    "move_index": m.move_index,
-                    "move_number": m.move_number,
-                    "color": m.color,
-                    "fen_before": m.fen_before,
-                    "player_move": m.player_move,
-                    "best_move": m.best_move,
-                    "eval_loss": m.eval_loss,
-                    "pv_moves": m.pv_moves,
-                    "explanation": exp,
-                    "position_features": vars(analyze_position(m.fen_before)),
-                }
-                for m, exp in zip(game_data.critical_moments, explanations)
-            ],
-            "game_summary": summary_and_plan.get("summary", {}),
-            "training_plan": summary_and_plan.get("training_plan", {}),
+            "engine_analysis": [_serialize_move(m) for m in game_data.all_analyzed],
+            "llm_available": self._llm_available,
         }
 
-    async def _explain_mistake(self, m: MoveAnalysis) -> dict:
+        if not game_data.critical_moments:
+            return {**base, "critical_moments": [], "game_summary": None, "training_plan": None}
+
+        if not self._llm_available:
+            critical_moments = []
+            for m in game_data.critical_moments:
+                critical_moments.append(
+                    {
+                        **_serialize_move(m),
+                        "fen_before": m.fen_before,
+                        "explanation": None,
+                        "position_features": await self._position_features(m.fen_before),
+                    }
+                )
+            return {
+                **base,
+                "critical_moments": critical_moments,
+                "game_summary": None,
+                "training_plan": {"puzzles": self._build_training_puzzles(game_data, [])},
+            }
+
+        english_explanations = []
+        for moment in game_data.critical_moments:
+            english_explanations.append(await self._explain_mistake(moment))
+
+        summary_data = await self._generate_summary(game_data, english_explanations)
+
+        output_explanations = []
+        for exp in english_explanations:
+            output_explanations.append(await self._translate_explanation(exp) if exp else None)
+        output_summary = await self._translate_summary(summary_data) if summary_data else None
+        puzzles = self._build_training_puzzles(game_data, output_explanations)
+
+        critical_moments = []
+        for m, exp in zip(game_data.critical_moments, output_explanations):
+            critical_moments.append(
+                {
+                    **_serialize_move(m),
+                    "fen_before": m.fen_before,
+                    "explanation": exp,
+                    "position_features": await self._position_features(m.fen_before),
+                }
+            )
+
+        return {
+            **base,
+            "critical_moments": critical_moments,
+            "game_summary": output_summary.get("summary") if output_summary else None,
+            "training_plan": self._merge_training_puzzles(
+                output_summary.get("training_plan") if output_summary else None,
+                puzzles,
+            ),
+        }
+
+    async def _explain_mistake(self, m: MoveAnalysis) -> dict | None:
         features = analyze_position(m.fen_before)
         prompt = _mistake_prompt(m, features, self.player_elo)
         try:
-            resp = await _client.messages.create(
-                model=_MODEL,
-                max_tokens=1024,
-                system=[{"type": "text", "text": _SYSTEM, "cache_control": {"type": "ephemeral"}}],
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return _parse_json(resp.content[0].text)
+            text = await call_llm(_SYSTEM, prompt, max_tokens=LLM_EXPLANATION_MAX_TOKENS)
+            return _normalize_explanation(parse_llm_json(text), m)
         except Exception as e:
-            print(f"[explainer] Claude error for move {m.player_move}: {e}")
-            return _fallback_explanation(m)
+            print(f"[explainer] LLM error for move {m.player_move}: {type(e).__name__}: {e}")
+            return None
 
-    async def _generate_summary(self, game_data: GameData, explanations: list[dict]) -> dict:
-        prompt = _summary_prompt(game_data, explanations, self.player_elo)
+    async def _generate_summary(self, game_data: GameData, explanations: list) -> dict | None:
+        valid = [e for e in explanations if e is not None]
+        if not valid:
+            return None
+        prompt = _summary_prompt(game_data, valid, self.player_elo)
         try:
-            resp = await _client.messages.create(
-                model=_MODEL,
-                max_tokens=1024,
-                system=[{"type": "text", "text": _SYSTEM, "cache_control": {"type": "ephemeral"}}],
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return _parse_json(resp.content[0].text)
+            text = await call_llm(_SYSTEM, prompt, max_tokens=LLM_SUMMARY_MAX_TOKENS)
+            return parse_llm_json(text)
         except Exception as e:
-            print(f"[explainer] Claude summary error: {e}")
-            return _fallback_summary()
+            print(f"[explainer] LLM summary error: {type(e).__name__}: {e}")
+            return None
+
+    async def _position_features(self, fen: str) -> dict:
+        features = _position_features_dict(fen)
+        if self.language != "zh":
+            return features
+        try:
+            translated = await translate_json_values(features, "zh")
+            return translated if isinstance(translated, dict) else features
+        except Exception as e:
+            print(f"[explainer] translation error for position features: {type(e).__name__}: {e}")
+            return features
+
+    async def _translate_explanation(self, explanation: dict) -> dict:
+        if self.language != "zh":
+            return explanation
+        payload = {
+            key: explanation[key]
+            for key in _EXPLANATION_TRANSLATABLE_FIELDS
+            if key in explanation
+        }
+        try:
+            translated = await translate_json_values(payload, "zh")
+            if isinstance(translated, dict):
+                return {**explanation, **translated}
+        except Exception as e:
+            print(f"[explainer] translation error for explanation: {type(e).__name__}: {e}")
+        return explanation
+
+    async def _translate_summary(self, summary_data: dict) -> dict:
+        if self.language != "zh":
+            return summary_data
+        payload = {
+            "summary": {
+                key: value
+                for key, value in summary_data.get("summary", {}).items()
+                if key != "accuracy_grade"
+            },
+            "training_plan": summary_data.get("training_plan", {}),
+        }
+        try:
+            translated = await translate_json_values(payload, "zh")
+            if isinstance(translated, dict):
+                merged = dict(summary_data)
+                merged_summary = dict(summary_data.get("summary", {}))
+                merged_summary.update(translated.get("summary", {}))
+                merged["summary"] = merged_summary
+                if "training_plan" in translated:
+                    merged["training_plan"] = translated["training_plan"]
+                return merged
+        except Exception as e:
+            print(f"[explainer] translation error for summary: {type(e).__name__}: {e}")
+        return summary_data
+
+    def _build_training_puzzles(self, game_data: GameData, explanations: list[dict | None]) -> list[dict]:
+        puzzles = []
+        for index, moment in enumerate(game_data.critical_moments):
+            explanation = explanations[index] if index < len(explanations) else None
+            label = explanation.get("mistake_label") if explanation else f"Find {moment.best_move}"
+            category = explanation.get("mistake_category") if explanation else moment.severity
+            coach_question = explanation.get("coach_question") if explanation else None
+            puzzles.append(
+                {
+                    "id": f"{moment.move_index}-{moment.best_move}",
+                    "fen": moment.fen_before,
+                    "move_number": moment.move_number,
+                    "side_to_move": moment.color,
+                    "prompt": coach_question or "Find the engine move and explain what it fixes.",
+                    "solution": moment.best_move,
+                    "solution_line": moment.pv_moves,
+                    "theme": category,
+                    "source_mistake": moment.player_move,
+                    "label": label,
+                }
+            )
+        return puzzles
+
+    def _merge_training_puzzles(self, training_plan: dict | None, puzzles: list[dict]) -> dict | None:
+        if training_plan is None and not puzzles:
+            return None
+        merged = dict(training_plan or {})
+        merged["puzzles"] = puzzles
+        return merged
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
-def _parse_json(text: str) -> dict:
-    text = text.strip()
-    if text.startswith("```"):
-        parts = text.split("```")
-        text = parts[1].lstrip("json").strip() if len(parts) > 1 else text
-    return json.loads(text)
+def _normalize_explanation(data: dict, m: MoveAnalysis) -> dict:
+    """Keep the frontend stable even if an LLM returns an older shape."""
+    why_player = data.get("why_player_move", "")
+    why_best = data.get("why_best_move", "")
+    engine_line = " ".join(m.pv_moves) if m.pv_moves else m.best_move
+
+    data.setdefault("mistake_category", "strategic_misunderstanding")
+    data.setdefault("mistake_label", f"Better was {m.best_move}")
+    engine_layer = _ensure_dict(data, "engine_layer")
+    engine_layer.setdefault(
+        "eval_summary",
+        f"{m.player_move} lost about {m.eval_loss / 100:.1f} pawns; Stockfish preferred {m.best_move}.",
+    )
+    engine_layer.setdefault("best_line", engine_line)
+    engine_layer.setdefault(
+        "candidate_summary",
+        why_best or "The top engine candidate handles the position's most urgent problem.",
+    )
+
+    tactical_layer = _ensure_dict(data, "tactical_layer")
+    tactical_layer.setdefault("motif", "Review forcing moves")
+    tactical_layer.setdefault(
+        "explanation",
+        why_player or "Check whether either side has checks, captures, or direct threats.",
+    )
+
+    strategic_layer = _ensure_dict(data, "strategic_layer")
+    strategic_layer.setdefault("concept", "Position priorities")
+    strategic_layer.setdefault(
+        "explanation",
+        why_best or "The best move improves the position before pursuing a less urgent plan.",
+    )
+
+    human_layer = _ensure_dict(data, "human_layer")
+    human_layer.setdefault(
+        "likely_thought",
+        why_player or f"{m.player_move} probably looked natural during the game.",
+    )
+    human_layer.setdefault(
+        "correction",
+        "Pause before natural moves and identify the opponent's most forcing reply.",
+    )
+    data.setdefault("engine_line_idea", why_best or "Compress the engine line into the main positional idea.")
+    data.setdefault("coach_question", "What is your opponent's most forcing move if you play your intended move?")
+    if not isinstance(data.get("how_to_find"), list):
+        data["how_to_find"] = [
+            "Check forcing moves first",
+            "Compare candidate moves",
+            "Ask what the best move prevents",
+        ]
+    data.setdefault("key_lesson", "Natural moves still need a forcing-move check.")
+    return data
 
 
-def _fallback_explanation(m: MoveAnalysis) -> dict:
-    return {
-        "mistake_category": "tactical_blindness",
-        "mistake_label": f"Move {m.move_number}: suboptimal choice",
-        "why_player_move": (
-            f"{m.player_move} is a natural-looking move, but it loses about "
-            f"{m.eval_loss // 100:.1f} pawn{'s' if m.eval_loss >= 200 else ''} of advantage."
-        ),
-        "why_best_move": (
-            f"{m.best_move} is stronger because it better addresses the key tension in the position."
-        ),
-        "engine_line_idea": "The best continuation improves piece coordination and controls key squares.",
-        "how_to_find": [
-            "Before moving, check: does my opponent have a check, capture, or major threat?",
-            "Ask: which of my pieces is least active? Can I improve it?",
-            "Consider: does my move create any new weaknesses?",
-        ],
-        "key_lesson": "Always check your opponent's forcing moves before executing your own plan.",
-    }
-
-
-def _fallback_summary() -> dict:
-    return {
-        "summary": {
-            "biggest_strength": "You fought through the game and completed all phases",
-            "biggest_weakness": "Missing opponent's forcing moves (checks, captures, threats)",
-            "key_concept": "Candidate move thinking — always check opponent threats first",
-            "opening_tip": "Review the first 10 moves of your opening and understand each move's purpose",
-            "accuracy_grade": "C",
-        },
-        "training_plan": {
-            "focus_concept": "Checks, Captures, Threats",
-            "focus_explanation": (
-                "Before every move, scan for your opponent's forcing options. "
-                "This simple habit prevents most tactical blunders."
-            ),
-            "puzzle_themes": ["Forks", "Pins", "Back-rank checkmates"],
-            "pre_move_checklist": [
-                "Does my opponent have a check?",
-                "Does my opponent have a capture?",
-                "Does my opponent have a threat I must address?",
-            ],
-            "weekly_schedule": [
-                {"day": "Day 1", "task": "Solve 10 fork puzzles (15 min)"},
-                {"day": "Day 2", "task": "Re-play this game and pause at each mistake position"},
-                {"day": "Day 3", "task": "Solve 10 pin + discovered attack puzzles (15 min)"},
-                {"day": "Day 4", "task": "Light review — read through your checklist"},
-                {"day": "Day 5", "task": "Play a 15+10 game and use the pre-move checklist every move"},
-            ],
-        },
-    }
-
-
-def _no_mistakes_result(game_data: GameData) -> dict:
-    return {
-        "game": {
-            "moves_san": game_data.moves_san,
-            "fens": game_data.fens,
-            "player_color": game_data.player_color,
-            "headers": game_data.headers,
-            "total_moves": game_data.total_moves,
-        },
-        "critical_moments": [],
-        "game_summary": {
-            "biggest_strength": "Excellent accuracy throughout — no major mistakes detected!",
-            "biggest_weakness": "No significant mistakes found in this game",
-            "key_concept": "Keep refining strategic understanding and calculation depth",
-            "opening_tip": "Your opening play was solid",
-            "accuracy_grade": "A",
-        },
-        "training_plan": {
-            "focus_concept": "Advanced Strategy",
-            "focus_explanation": "You played very accurately. Focus on refining long-term strategic planning.",
-            "puzzle_themes": ["Complex tactics", "Endgame technique", "Positional sacrifices"],
-            "pre_move_checklist": [
-                "What is my opponent's best response to my move?",
-                "Can I improve my worst-placed piece?",
-                "Is there a pawn break I should consider?",
-            ],
-            "weekly_schedule": [
-                {"day": "Day 1", "task": "Study an endgame concept (rook endgames, 20 min)"},
-                {"day": "Day 2", "task": "Solve advanced tactical puzzles (20 min)"},
-                {"day": "Day 3", "task": "Play a training game with focus on strategic planning"},
-                {"day": "Day 4", "task": "Review a master game in your opening"},
-                {"day": "Day 5", "task": "Analyze your game from Day 3"},
-            ],
-        },
-    }
+def _ensure_dict(data: dict, key: str) -> dict:
+    value = data.get(key)
+    if not isinstance(value, dict):
+        value = {}
+        data[key] = value
+    return value

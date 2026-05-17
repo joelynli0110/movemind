@@ -11,7 +11,9 @@ import { useCallback, useEffect, useRef } from "react";
 import dynamic from "next/dynamic";
 import { Chess } from "chess.js";
 import { ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight } from "lucide-react";
-import type { CriticalMoment } from "@/lib/types";
+import type { CriticalMoment, Language } from "@/lib/types";
+import type { Arrow, Square } from "react-chessboard/dist/chessboard/types";
+import { reviewCopy } from "@/lib/i18n";
 
 const Chessboard = dynamic(
   () => import("react-chessboard").then((m) => m.Chessboard),
@@ -26,6 +28,7 @@ interface Props {
   criticalMoments: CriticalMoment[];
   activeMistakeIndex: number | null;
   onIndexChange: (idx: number) => void;
+  language: Language;
 }
 
 export default function ChessBoardViewer({
@@ -36,8 +39,10 @@ export default function ChessBoardViewer({
   criticalMoments,
   activeMistakeIndex,
   onIndexChange,
+  language,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const labels = reviewCopy[language].board;
 
   const fen = fens[currentIndex] ?? fens[0];
   const total = movesSan.length;
@@ -45,7 +50,7 @@ export default function ChessBoardViewer({
   const canForward = currentIndex < total;
 
   // Arrow highlighting for the active mistake
-  const arrows = useCallback((): [string, string, string?][] => {
+  const arrows = useCallback((): Arrow[] => {
     if (activeMistakeIndex === null) return [];
     const moment = criticalMoments[activeMistakeIndex];
     if (!moment) return [];
@@ -53,21 +58,21 @@ export default function ChessBoardViewer({
     // We're at the "before" position — show player's move (red) and best move (green)
     if (currentIndex !== moment.move_index) return [];
 
-    const arrs: [string, string, string?][] = [];
+    const arrs: Arrow[] = [];
     try {
       const chess = new Chess(moment.fen_before);
 
       // Player's move — red
       const playerMove = chess.move(moment.player_move, { strict: false });
       if (playerMove) {
-        arrs.push([playerMove.from, playerMove.to, "rgba(220,38,38,0.8)"]);
+        arrs.push([playerMove.from as Square, playerMove.to as Square, "rgba(220,38,38,0.8)"]);
         chess.undo();
       }
 
       // Best move — green
       const bestMove = chess.move(moment.best_move, { strict: false });
       if (bestMove) {
-        arrs.push([bestMove.from, bestMove.to, "rgba(34,197,94,0.8)"]);
+        arrs.push([bestMove.from as Square, bestMove.to as Square, "rgba(34,197,94,0.8)"]);
       }
     } catch {
       // SAN parse can fail in edge cases; just show no arrows
@@ -125,13 +130,13 @@ export default function ChessBoardViewer({
       {/* Navigation controls */}
       <div className="flex items-center justify-between bg-slate-800/60 rounded-xl px-3 py-2 border border-slate-700/40">
         <div className="flex items-center gap-1">
-          <NavBtn icon={ChevronsLeft} disabled={!canBack} onClick={() => onIndexChange(0)} title="Start" />
-          <NavBtn icon={ChevronLeft} disabled={!canBack} onClick={() => onIndexChange(currentIndex - 1)} title="Previous (←)" />
-          <NavBtn icon={ChevronRight} disabled={!canForward} onClick={() => onIndexChange(currentIndex + 1)} title="Next (→)" />
-          <NavBtn icon={ChevronsRight} disabled={!canForward} onClick={() => onIndexChange(total)} title="End" />
+          <NavBtn icon={ChevronsLeft} disabled={!canBack} onClick={() => onIndexChange(0)} title={labels.start} />
+          <NavBtn icon={ChevronLeft} disabled={!canBack} onClick={() => onIndexChange(currentIndex - 1)} title={labels.previous} />
+          <NavBtn icon={ChevronRight} disabled={!canForward} onClick={() => onIndexChange(currentIndex + 1)} title={labels.next} />
+          <NavBtn icon={ChevronsRight} disabled={!canForward} onClick={() => onIndexChange(total)} title={labels.end} />
         </div>
         <span className="text-xs text-slate-500 font-mono">
-          {currentIndex === 0 ? "Start" : `${Math.ceil(currentIndex / 2)}.${currentIndex % 2 === 1 ? "" : "."} ${movesSan[currentIndex - 1] ?? ""}`}
+          {currentIndex === 0 ? labels.start : `${Math.ceil(currentIndex / 2)}.${currentIndex % 2 === 1 ? "" : "."} ${movesSan[currentIndex - 1] ?? ""}`}
         </span>
       </div>
 

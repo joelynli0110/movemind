@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 from typing import Optional
 
@@ -33,13 +34,16 @@ async def analyze_pgn_file(
     pgn: UploadFile = File(...),
     player_name: Optional[str] = Form(None),
     player_elo: int = Form(1200),
+    language: str = Form("en"),
 ):
     """Accept a PGN file upload and start background analysis."""
     raw = await pgn.read()
     pgn_text = raw.decode("utf-8", errors="replace")
     game_id = str(uuid.uuid4())
     _store[game_id] = {"status": "processing"}
-    background_tasks.add_task(_run_analysis, game_id, pgn_text, player_name, player_elo)
+    background_tasks.add_task(
+        _run_analysis, game_id, pgn_text, player_name, player_elo, language
+    )
     return {"game_id": game_id, "status": "processing"}
 
 
@@ -52,7 +56,12 @@ async def analyze_pgn_text(
     game_id = str(uuid.uuid4())
     _store[game_id] = {"status": "processing"}
     background_tasks.add_task(
-        _run_analysis, game_id, body.pgn_text, body.player_name, body.player_elo
+        _run_analysis,
+        game_id,
+        body.pgn_text,
+        body.player_name,
+        body.player_elo,
+        body.language,
     )
     return {"game_id": game_id, "status": "processing"}
 
@@ -77,12 +86,12 @@ async def _run_analysis(
     pgn_text: str,
     player_name: Optional[str],
     player_elo: int,
+    language: str,
 ):
     try:
-        analyst = EngineAnalyst()
-        game_data = analyst.analyze_game(pgn_text, player_name)
+        game_data = await asyncio.to_thread(_analyze_with_engine, pgn_text, player_name)
 
-        explainer = CoachExplainer(player_elo=player_elo)
+        explainer = CoachExplainer(player_elo=player_elo, language=language)
         result = await explainer.explain_game(game_data)
 
         _store[game_id] = {"status": "complete", "result": result}
@@ -90,3 +99,8 @@ async def _run_analysis(
         import traceback
         traceback.print_exc()
         _store[game_id] = {"status": "error", "error": str(exc)}
+
+
+def _analyze_with_engine(pgn_text: str, player_name: Optional[str]):
+    analyst = EngineAnalyst()
+    return analyst.analyze_game(pgn_text, player_name)
